@@ -1,0 +1,6 @@
+gymnasium==0.29.1
+numpy>=1.26
+torch
+tyro
+pygame==2.0.1
+tensorboard

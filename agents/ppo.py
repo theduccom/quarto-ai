@@ -1,0 +1,500 @@
+import os
+import random
+import time
+from dataclasses import dataclass
+
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import tyro
+from gymnasium import spaces
+from torch.distributions.categorical import Categorical
+from torch.utils.tensorboard import SummaryWriter
+
+# Import the Quarto environment
+from quarto_env.constants import BOARD_SIZE, NUM_PIECES, NUM_PLAYERS
+from quarto_env.quarto_env import QuartoEnv
+
+# Important: Suppress the pygame output (if no display is available)
+os.environ["SDL_VIDEODRIVER"] = "dummy"
+
+# def record_video_every_fn(episode_id: int) -> bool:
+#     return episode_id % 3 == 0
+
+
+@dataclass
+class Args:
+    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    """the name of this experiment"""
+    seed: int = 1
+    """seed of the experiment"""
+    torch_deterministic: bool = True
+    """if toggled, `torch.backends.cudnn.deterministic=False`"""
+    cuda: bool = True
+    """if toggled, cuda will be enabled by default"""
+    track: bool = False
+    """if toggled, this experiment will be tracked with Weights and Biases"""
+    wandb_project_name: str = "cleanRL"
+    """the wandb's project name"""
+    wandb_entity: str = None
+    """the entity (team) of wandb's project"""
+    capture_video: bool = False
+    """whether to capture videos of the agent performances (check out `videos` folder)"""
+
+    # Algorithm specific arguments
+    env_id: str = "QuartoEnv-v0"
+    """the id of the environment"""
+    total_timesteps: int = 50_000_000
+    """total timesteps of the experiments"""
+    learning_rate: float = 2.5e-4
+    """the learning rate of the optimizer"""
+    num_envs: int = 1
+    """the number of parallel game environments"""
+    num_steps: int = 512
+    """the number of steps to run in each environment per policy rollout"""
+    anneal_lr: bool = True
+    """Toggle learning rate annealing for policy and value networks"""
+    gamma: float = 0.99
+    """the discount factor gamma"""
+    gae_lambda: float = 0.95
+    """the lambda for the general advantage estimation"""
+    num_minibatches: int = 4
+    """the number of mini-batches"""
+    update_epochs: int = 4
+    """the K epochs to update the policy"""
+    norm_adv: bool = True
+    """Toggles advantages normalization"""
+    clip_coef: float = 0.1
+    """the surrogate clipping coefficient"""
+    clip_vloss: bool = True
+    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
+    ent_coef: float = 0.001
+    """coefficient of the entropy"""
+    vf_coef: float = 0.5
+    """coefficient of the value function"""
+    max_grad_norm: float = 0.5
+    """the maximum norm for the gradient clipping"""
+    target_kl: float = None
+    """the target KL divergence threshold"""
+
+    # to be filled in runtime
+    batch_size: int = 0
+    """the batch size (computed in runtime)"""
+    minibatch_size: int = 0
+    """the mini-batch size (computed in runtime)"""
+    num_iterations: int = 0
+    """the number of iterations (computed in runtime)"""
+
+
+# Save the model
+def save_model(agent, path):
+    torch.save(agent.state_dict(), path)
+
+
+# Load the model
+def load_model(agent, path):
+    agent.load_state_dict(torch.load(path))
+
+
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
+def make_env(env_id, idx, capture_video, run_name):
+    def thunk():
+        env = QuartoEnv()
+        # Record the episode statistics (not used for now)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        # if capture_video and idx == 0:
+        #     env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", episode_trigger=record_video_every_fn)
+        return env
+    return thunk
+
+
+def _player_one_hot(player_arr: np.ndarray) -> np.ndarray:
+    """(n_envs,) int -> (n_envs, NUM_PLAYERS) float one-hot."""
+    p = player_arr.astype(np.int64).reshape(-1)
+    oh = np.zeros((p.shape[0], NUM_PLAYERS), dtype=np.float32)
+    oh[np.arange(p.shape[0]), p] = 1.0
+    return oh
+
+
+def _compute_action_masks(board: torch.Tensor, remaining_pieces: torch.Tensor):
+    """
+    Build per-head masks for Tuple action space:
+    - position head: valid where board cell is empty (-1)
+    - next_piece head: valid where remaining_pieces == 1
+    """
+    position_mask = board.view(board.shape[0], -1) == -1
+    next_piece_mask = remaining_pieces > 0.5
+    return position_mask, next_piece_mask
+
+
+class Agent(nn.Module):
+    def __init__(self, envs):
+        super().__init__()
+        # Convolutional network for the board state
+        self.board_network = nn.Sequential(
+            nn.Conv2d(1, 32, 3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        board_dim = 64 * BOARD_SIZE * BOARD_SIZE
+
+        # Fully connected network for remaining pieces (which of 16 are still available)
+        self.remaining_pieces_network = nn.Sequential(
+            nn.Linear(NUM_PIECES, 64),
+            nn.ReLU(),
+        )
+        # Embedding for the piece currently given to the player to place
+        self.current_piece_embed = nn.Embedding(NUM_PIECES, 32)
+        # Small MLP for current player (one-hot)
+        self.current_player_network = nn.Sequential(
+            nn.Linear(NUM_PLAYERS, 16),
+            nn.ReLU(),
+            nn.Linear(16, 16),
+            nn.ReLU(),
+        )
+        # Combined network
+        combined_in = board_dim + 64 + 32 + 16
+        self.fc1 = nn.Linear(combined_in, 512)
+        self.relu = nn.ReLU()
+
+        # Define the action dimensions
+        self.action_dims = [
+            envs.single_action_space.spaces[i].n
+            for i in range(len(envs.single_action_space.spaces))
+        ]
+        self.actors = nn.ModuleList(
+            [nn.Linear(512, action_dim) for action_dim in self.action_dims]
+        )
+        self.critic = nn.Linear(512, 1)
+
+    def forward(self, board, remaining_pieces, current_piece_idx, current_player_oh):
+        # Process the board and piece-related signals separately
+        board_features = self.board_network(board)
+        rem_features = self.remaining_pieces_network(remaining_pieces)
+        cur_piece_features = self.current_piece_embed(current_piece_idx.long().squeeze(-1))
+        player_features = self.current_player_network(current_player_oh)
+        # Combine the features
+        combined = torch.cat(
+            (board_features, rem_features, cur_piece_features, player_features), dim=-1
+        )
+        return self.relu(self.fc1(combined))
+
+    def get_value(self, board, remaining_pieces, current_piece_idx, current_player_oh):
+        return self.critic(
+            self.forward(board, remaining_pieces, current_piece_idx, current_player_oh)
+        )
+
+    def get_action_and_value(
+        self,
+        board,
+        remaining_pieces,
+        current_piece_idx,
+        current_player_oh,
+        action=None,
+        action_masks=None,
+    ):
+        hidden = self.forward(board, remaining_pieces, current_piece_idx, current_player_oh)
+        logits = [actor(hidden) for actor in self.actors]
+        if action_masks is not None:
+            # Mask invalid actions by pushing logits to a very negative value.
+            for i, mask in enumerate(action_masks):
+                logits[i] = logits[i].masked_fill(~mask.bool(), -1e9)
+        probs = [Categorical(logits=logit) for logit in logits]
+
+        if action is None:
+            action = torch.stack([prob.sample() for prob in probs], dim=1)
+
+        logprobs = torch.stack(
+            [prob.log_prob(act) for prob, act in zip(probs, action.T)], dim=-1
+        ).sum(dim=-1)
+        entropy = torch.stack([prob.entropy() for prob in probs], dim=-1).sum(dim=-1)
+
+        return action, logprobs, entropy, self.critic(hidden)
+
+
+if __name__ == "__main__":
+    # 1) Parse CLI args and derive rollout/update sizes used by PPO.
+    args = tyro.cli(Args)
+    args.batch_size = int(args.num_envs * args.num_steps)
+    args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    args.num_iterations = args.total_timesteps // args.batch_size
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    if args.track:
+        import wandb
+
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(args),
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    )
+
+    # TRY NOT TO MODIFY: seeding
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = args.torch_deterministic
+
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+
+    # env setup
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+    )
+    assert isinstance(envs.single_action_space, spaces.Tuple), (
+        "only Tuple action space is supported"
+    )
+
+    agent = Agent(envs).to(device)
+    print("Agent Architecture")
+    print(agent)
+
+    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+    # ALGO Logic: Storage setup
+    # Rollout buffers are [time, env, ...] so we can compute GAE over time.
+    obs = {
+        # Board is a single-channel 4x4 grid of piece ids (-1 for empty).
+        "board": torch.zeros(
+            (args.num_steps, args.num_envs, 1, BOARD_SIZE, BOARD_SIZE), device=device
+        ),
+        # Binary mask: 1 means piece is still available to hand over.
+        "remaining_pieces": torch.zeros(
+            (args.num_steps, args.num_envs, NUM_PIECES), device=device
+        ),
+        # Current piece id to place this turn.
+        "current_piece": torch.zeros((args.num_steps, args.num_envs, 1), device=device),
+        # One-hot current player vector.
+        "current_player": torch.zeros(
+            (args.num_steps, args.num_envs, NUM_PLAYERS), device=device
+        ),  # one-hot: player 0 vs 1
+    }
+    # (position, next_piece) — Discrete indices for Tuple action space
+    actions = torch.zeros(
+        (args.num_steps, args.num_envs, len(envs.single_action_space.spaces)),
+        dtype=torch.long,
+        device=device,
+    )
+    logprobs = torch.zeros((args.num_steps, args.num_envs), device=device)
+    rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
+    dones = torch.zeros((args.num_steps, args.num_envs), device=device)
+    values = torch.zeros((args.num_steps, args.num_envs), device=device)
+
+    # TRY NOT TO MODIFY: start the game
+    global_step = 0
+    start_time = time.time()
+    # First observation after reset; converted to tensors once here, then every step.
+    next_obs, _ = envs.reset(seed=args.seed)
+    next_obs_board = torch.as_tensor(next_obs["board"], dtype=torch.float32, device=device).unsqueeze(1)
+    next_obs_remaining = torch.as_tensor(
+        next_obs["remaining_pieces"], dtype=torch.float32, device=device
+    )
+    next_obs_cur_piece = torch.as_tensor(
+        next_obs["current_piece"], dtype=torch.float32, device=device
+    ).view(args.num_envs, 1)
+    next_obs_player = torch.as_tensor(
+        _player_one_hot(next_obs["current_player"]), dtype=torch.float32, device=device
+    )
+    next_done = torch.zeros(args.num_envs, device=device)
+
+    for iteration in range(1, args.num_iterations + 1):
+        # Annealing the rate if instructed to do so.
+        if args.anneal_lr:
+            frac = 1.0 - (iteration - 1.0) / args.num_iterations
+            optimizer.param_groups[0]["lr"] = frac * args.learning_rate
+
+        for step in range(0, args.num_steps):
+            # Save state at t before sampling action_t.
+            global_step += args.num_envs
+            obs["board"][step] = next_obs_board
+            obs["remaining_pieces"][step] = next_obs_remaining
+            obs["current_piece"][step] = next_obs_cur_piece
+            obs["current_player"][step] = next_obs_player
+            dones[step] = next_done
+
+            # ALGO LOGIC: action logic
+            with torch.no_grad():
+                action_masks = _compute_action_masks(next_obs_board, next_obs_remaining)
+                action, logprob, _, value = agent.get_action_and_value(
+                    next_obs_board,
+                    next_obs_remaining,
+                    next_obs_cur_piece,
+                    next_obs_player,
+                    action_masks=action_masks,
+                )
+                values[step] = value.flatten()
+            actions[step] = action
+            logprobs[step] = logprob
+
+            # TRY NOT TO MODIFY: execute the game and log data.
+            step_action = action.cpu().numpy()
+            next_obs, reward, terminations, truncations, infos = envs.step(step_action)
+            next_done = np.logical_or(terminations, truncations)
+            rewards[step] = torch.as_tensor(reward, dtype=torch.float32, device=device).view(-1)
+
+            # Prepare tensors for the next loop iteration.
+            next_obs_board = torch.as_tensor(
+                next_obs["board"], dtype=torch.float32, device=device
+            ).unsqueeze(1)
+            next_obs_remaining = torch.as_tensor(
+                next_obs["remaining_pieces"], dtype=torch.float32, device=device
+            )
+            next_obs_cur_piece = torch.as_tensor(
+                next_obs["current_piece"], dtype=torch.float32, device=device
+            ).view(args.num_envs, 1)
+            next_obs_player = torch.as_tensor(
+                _player_one_hot(next_obs["current_player"]), dtype=torch.float32, device=device
+            )
+            next_done = torch.as_tensor(next_done, dtype=torch.float32, device=device)
+
+            if "final_info" in infos:
+                for info in infos["final_info"]:
+                    if info and "episode" in info:
+                        print(
+                            f"global_step={global_step}, episodic_return={info['episode']['r']}"
+                        )
+                        writer.add_scalar(
+                            "charts/episodic_return", info["episode"]["r"], global_step
+                        )
+                        writer.add_scalar(
+                            "charts/episodic_length", info["episode"]["l"], global_step
+                        )
+
+        # bootstrap value if not done
+        with torch.no_grad():
+            next_value = agent.get_value(
+                next_obs_board,
+                next_obs_remaining,
+                next_obs_cur_piece,
+                next_obs_player,
+            ).reshape(-1, 1)
+            advantages = torch.zeros_like(rewards, device=device)
+            lastgaelam = 0
+            # Compute GAE-lambda advantages backwards through the rollout.
+            for t in reversed(range(args.num_steps)):
+                if t == args.num_steps - 1:
+                    nextnonterminal = 1.0 - next_done
+                    nextvalues = next_value
+                else:
+                    nextnonterminal = 1.0 - dones[t + 1]
+                    nextvalues = values[t + 1]
+                delta = (
+                    rewards[t]
+                    + args.gamma * nextvalues.flatten() * nextnonterminal
+                    - values[t]
+                )
+                advantages[t] = lastgaelam = (
+                    delta
+                    + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                )
+            returns = advantages + values
+
+        # flatten the batch
+        # [time, env, ...] -> [time*env, ...] for SGD minibatching.
+        b_obs_board = obs["board"].reshape((-1, 1, BOARD_SIZE, BOARD_SIZE))
+        b_obs_rem = obs["remaining_pieces"].reshape((-1, NUM_PIECES))
+        b_obs_cur = obs["current_piece"].reshape((-1, 1))
+        b_obs_player = obs["current_player"].reshape((-1, NUM_PLAYERS))
+        b_logprobs = logprobs.reshape(-1)
+        b_actions = actions.reshape((-1, len(envs.single_action_space.spaces)))
+        b_advantages = advantages.reshape(-1)
+        b_returns = returns.reshape(-1)
+        b_values = values.reshape(-1)
+
+        # Optimizing the policy and value network
+        b_inds = np.arange(args.batch_size)
+        clipfracs = []
+        for epoch in range(args.update_epochs):
+            np.random.shuffle(b_inds)
+            for start in range(0, args.batch_size, args.minibatch_size):
+                end = start + args.minibatch_size
+                mb_inds = b_inds[start:end]
+
+                # Re-evaluate current policy on sampled minibatch actions.
+                mb_action_masks = _compute_action_masks(
+                    b_obs_board[mb_inds], b_obs_rem[mb_inds]
+                )
+                _, newlogprobs, entropy, newvalues = agent.get_action_and_value(
+                    b_obs_board[mb_inds],
+                    b_obs_rem[mb_inds],
+                    b_obs_cur[mb_inds],
+                    b_obs_player[mb_inds],
+                    b_actions[mb_inds],
+                    action_masks=mb_action_masks,
+                )
+                newvalues = newvalues.view(-1)
+                logratio = newlogprobs - b_logprobs[mb_inds]
+                ratio = logratio.exp()
+
+                with torch.no_grad():
+                    # Calculate the approx_kl
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    clipfracs += [
+                        ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
+                    ]
+
+                mb_advantages = b_advantages[mb_inds]
+                if args.norm_adv:
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                        mb_advantages.std() + 1e-8
+                    )
+
+                # Policy loss
+                pg_loss1 = -mb_advantages * ratio
+                pg_loss2 = -mb_advantages * torch.clamp(
+                    ratio, 1 - args.clip_coef, 1 + args.clip_coef
+                )
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                # Value loss
+                v_loss = (newvalues - b_returns[mb_inds]).pow(2).mean()
+                # Entropy loss
+                entropy_loss = entropy.mean()
+                # Total loss
+                loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+
+                # Standard PPO update step.
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                optimizer.step()
+
+        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        var_y = np.var(y_true)
+        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+        # Logging
+        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+        writer.add_scalar("losses/total_loss", loss.item(), global_step)
+        writer.add_scalar("charts/approx_kl", approx_kl.item(), global_step)
+        writer.add_scalar("charts/clipfrac", np.mean(clipfracs), global_step)
+        writer.add_scalar("charts/explained_variance", explained_var, global_step)
+
+        print(f"PPO Iteration {iteration} completed. Total steps: {global_step}")
+
+    envs.close()
+    writer.close()
